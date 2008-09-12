@@ -1,0 +1,17 @@
+#! /bin/sh
+
+# Find the installation directory.
+if [ ! "$(type -p mvl-whereami)" ] ; then
+    echo "Cannot locate MontaVista Linux tools; may be missing from PATH" >&2
+    exit 1
+fi
+edition_bindir="$(mvl-whereami)"
+install_root="${edition_bindir%/bin*}"
+
+# Set FREETYPE_CONFIG_ROOT_PREFIX to the root of the target directory
+# to adjust the output of target freetype-config.
+FREETYPE_CONFIG_ROOT_PREFIX="${install_root}/devkit/arm/v5t_le/target"
+export FREETYPE_CONFIG_ROOT_PREFIX
+
+# Invoke target freetype-config.
+exec "$FREETYPE_CONFIG_ROOT_PREFIX/usr/bin/freetype-config" "$@"

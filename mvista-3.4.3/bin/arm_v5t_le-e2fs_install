@@ -1,0 +1,306 @@
+#!/usr/bin/env python
+
+#  e2fs_install
+#
+#  Utility to install files into ext2 filesystem images.
+#
+#  Author: MontaVista Software, Inc.
+#          source@mvista.com
+#
+#  Copyright 2003 MontaVista Software Inc.
+#
+#  This program is free software; you can redistribute it and/or modify it
+#  under the terms of the GNU General Public License as published by the
+#  Free Software Foundation; either version 2 of the License, or (at your
+#  option) any later version.
+#
+#  THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
+#  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+#  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+#  OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+#  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+#  TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+#  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#  You should have received a copy of the GNU General Public License along
+#  with this program; if not, write to the Free Software Foundation, Inc.,
+#  675 Mass Ave, Cambridge, MA 02139, USA.
+
+import os, sys, string, struct
+from tempfile import mktemp
+
+class Pathname:
+    def __init__(self, path):
+	while os.path.islink(path):
+	    path = os.path.join(os.path.dirname(path), os.readlink(path))
+	    path = os.path.normpath(path)
+	self.path = path
+
+    def parent(self):
+	return Pathname(os.path.dirname(self.path))
+
+
+class Options:
+
+    class ArgumentError(Exception):
+	"Exception raised for errors when parsing command line arguments."
+
+    def __init__(self, arguments, optiondefs):
+	"Process commmand line arguments and initialize option settings."
+
+	from getopt import getopt, error
+
+	self.options = {}
+	self.help = []
+	hasarg = {}
+	longOptions = []
+	shortOptions = ''
+	names = {}
+
+	for name, short, arg, default, help in optiondefs:
+	    self.options[name] = default
+	    self.help.append(help)
+
+	    names['--' + name] = name
+	    if short != None:
+		names['-' + short] = name
+
+	    if arg:
+		hasarg[name] = 1
+		longOptions.append(name + '=')
+		if short != None:
+		    shortOptions = shortOptions + short + ':'
+	    else:
+		hasarg[name] = 0
+		longOptions.append(name)
+		if short != None:
+		    shortOptions = shortOptions + short
+
+	try:
+	    options, self.arguments = getopt(arguments,shortOptions,longOptions)
+	except error, exception:
+	    raise Options.ArgumentError(exception)
+
+	for option, argument in options:
+	    name = names[option]
+	    if not hasarg[name]:
+		argument = 1
+	    self.options[name] = argument
+    
+    def __len__(self):
+	"Returns the length of the embedded dictionary."
+	return len(self.options)
+
+    def __getitem__(self, key):
+	"Gets the value for the given key from the embedded dictionary."
+	return self.options[key]
+
+    def __setitem__(self, key, value):
+	"Sets the value for the given key into the embedded dictionary."
+	self.options[key] = value
+
+    def getArguments(self):
+	"Return the list of non-option arguments."
+	return self.arguments
+
+    def printHelp(self, format, output=sys.stdout):
+	"Print option help."
+	for help in self.help:
+	    output.write(format % help)
+
+
+class CommandException(Exception):
+    pass
+
+
+ET_NONE = 0
+ET_EXEC = 2
+ET_DYN = 3
+
+def ELFType(path):
+    try:
+	file = open(path)
+	header = file.read(18)
+	if (len(header) != 18) or (header[:4] != '\x7fELF'):
+	    raise RuntimeError
+
+	if ord(header[5]) == 1:
+	    # Little-endian encoding
+	    type = struct.unpack('<H', header[16:])
+	elif ord(header[5]) == 2:
+	    # Big-endian encoding
+	    type = struct.unpack('>H', header[16:])
+	else:
+	    raise RuntimeError
+
+	return type[0]
+    except:
+	return ET_NONE
+
+
+name = os.path.basename(sys.argv[0])
+try:
+    prefix = name[0:string.rindex(name, '-')+1]
+except ValueError:
+    prefix = ''
+
+bindir = Pathname(os.path.abspath(sys.argv[0]))
+if sys.argv[0] != '':
+    bindir = bindir.parent()
+mvldir = bindir.parent().parent().parent().parent()
+hostbin = os.path.join(mvldir.path, 'bin')
+
+
+def debugfs_cmd(cmd):
+    if options['verbose']:
+	template = '%s/debugfs -w -R "%s" %s'
+    else:
+	template = '%s/debugfs -w -R "%s" %s > /dev/null'
+    result = os.system(template % (hostbin, cmd, options['image']))
+    if result != 0:
+	raise CommandException(os.strerror(result))
+
+
+def printUsage():
+    global name
+    print 'Usage:\t%s -i <image_file> [options] <source> <file>' % name
+    print '\t%s -i <image_file> [-b|-c] <major>,<minor> [options] <device>' % name
+    print '\t%s -i <image_file> -d [options] <directory>...' % name
+    print '\t%s -i <image_file> -l <target> <symlink>' % name
+
+optionList = (
+    ('block',	'b', 1, None,
+	('-b major,minor  --block=major,minor', 'Create a block device file.') ),
+    ('char',	'c', 1, None,
+	('-c major,minor  --char=major,minor', 'Create a character device file.') ),
+    ('directory',	'd', 0, 0,
+	('-d  --directory', 'Treat all arguments as directory names.') ),
+    ('group',		'g', 1, '0',
+	('-g gid  --group=gid', 'Install with group id "gid".') ),
+    ('help',		'h', 0, 0,
+	('-h  --help', 'Show detailed usage information.') ),
+    ('image',		'i', 1, None,
+	('-i file  --image=file', 'Install to ext2 image file "file".') ),
+    ('link',		'l', 1, None,
+	('-l target  --link=target', 'Create symbolic link to "target".') ),
+    ('mode',		'm', 1, '0755',
+	('-m MODE  --mode=MODE', 'Install with permissions "MODE".') ),
+    ('owner',		'o', 1, '0',
+	('-o uid  --owner=uid', 'Install with user id "uid".') ),
+    ('strip',		's', 0, 0,
+	('-s  --strip', 'Strip executable files.') ),
+    ('verbose',		'v', 0, 0,
+	('-v  --verbose', 'Generate additional status information.') ),
+)
+
+try:
+    options = Options(sys.argv[1:], optionList)
+except Options.ArgumentError, exception:
+    sys.exit('Error:  %s' % exception)
+
+args = options.getArguments()
+
+if options['help']:
+    printUsage()
+    print "Options:"
+    options.printHelp('  %-25s  %s\n')
+    sys.exit(0)
+
+if options['image'] == None:
+    sys.exit('Must specify image file with "-i".')
+elif not os.path.isfile(options['image']):
+    sys.exit('Invalid image file "%s".' % options['image'])
+
+for option in ('mode', 'group', 'owner'):
+    try:
+	options[option] = string.atoi(options[option], 0)
+    except ValueError:
+	sys.exit('Invalid %s' % option)
+
+selections = 0
+for option in ('directory', 'block', 'char', 'link'):
+    if options[option]:
+	selections = selections + 1
+if selections > 1:
+    printUsage()
+    sys.exit(1)
+
+if options['directory']:
+    for dir in args:
+	try:
+	    debugfs_cmd('mkdir %s' % dir)
+	    debugfs_cmd('chmod %#o %s' % (options['mode'], dir))
+	    debugfs_cmd('chgrp %d %s' % (options['group'], dir))
+	    debugfs_cmd('chown %d %s' % (options['owner'], dir))
+	except CommandException, exc:
+	    sys.exit(exc)
+elif options['block'] or options['char']:
+    if len(args) > 1:
+	printUsage()
+	sys.exit(1)
+
+    if options['block']:
+	rdev = options['block']
+	type = 'b'
+    else:
+	rdev = options['char']
+	type = 'c'
+
+    try:
+	major, minor = string.split(rdev, ',')
+	major = int(major)
+	minor = int(minor)
+    except ValueError:
+	sys.exit('Invalid argument:  %s' % rdev)
+
+    try:
+	debugfs_cmd('mknod %s %s %d %d' % (args[0], type, major, minor))
+	debugfs_cmd('chmod %#o %s' % (options['mode'], args[0]))
+	debugfs_cmd('chgrp %d %s' % (options['group'], args[0]))
+	debugfs_cmd('chown %d %s' % (options['owner'], args[0]))
+    except CommandException, exc:
+	sys.exit(exc)
+elif options['link']:
+    if len(args) > 1:
+	printUsage()
+	sys.exit(1)
+
+    try:
+	debugfs_cmd('symlink %s %s' % (options['link'], args[0]))
+    except CommandException, exc:
+	sys.exit(exc)
+else:
+    if len(args) != 2:
+	printUsage()
+	sys.exit(1)
+
+    # Add SOURCE... DIRECTORY format later
+    # Just do SOURCE DEST now
+
+    source, dest = args
+    if os.path.islink(source) or (not os.path.isfile(source)):
+	sys.exit('"%s" is not a regular file' % source)
+
+    tmp = None
+    if options['strip'] and (ELFType(source) in (ET_EXEC, ET_DYN)):
+	tmp = mktemp()
+	result = os.system('%sstrip -o %s -R .note -R .comment %s'
+	    % (prefix, tmp, source))
+	if result != 0:
+	    sys.exit('Cannot strip file "%s"' % source)
+	source = tmp
+
+    try:
+	try:
+	    debugfs_cmd('write %s %s' % (source, dest))
+	    debugfs_cmd('chmod %#o %s' % (options['mode'], dest))
+	    debugfs_cmd('chgrp %d %s' % (options['group'], dest))
+	    debugfs_cmd('chown %d %s' % (options['owner'], dest))
+	except CommandException, exc:
+	    sys.exit(exc)
+    finally:
+	if tmp != None:
+	    os.remove(tmp)

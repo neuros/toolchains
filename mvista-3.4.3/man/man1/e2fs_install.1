@@ -1,0 +1,60 @@
+.TH INSTALL "1" "May 2003" "MontaVista Linux" "User Commands"
+.SH NAME
+e2fs_install \- add files to ext2 filesystem image
+.SH SYNOPSIS
+.B install
+\fI-i\fR \fIIMAGE\fR
+[\fIOPTION\fR]... \fISOURCE DEST\fR
+.br
+.B install
+\fI-i\fR \fIIMAGE\fR
+[\fI-b\fR|\fI-c\fR] \fIMAJOR\fR,\fIMINOR\fR \fIDEST\fR
+.br
+.B install
+\fI-i\fR \fIIMAGE\fR
+\fI-d\fR [\fIOPTION\fR]... \fIDIRECTORY\fR...
+.br
+.B install
+\fI-i\fR \fIIMAGE\fR
+\fI-l\fR \fITARGET\fR \fIDEST\fR
+.SH DESCRIPTION
+.PP
+This utility is used to populate a filesystem image in ext2 format
+which exists as a single file in the local filesystem.
+The various formats above are used to create regular files,
+device nodes, directories and symbolic links.
+.TP
+\fB\-b\fR, \fB\-\-block\fR=\fIMAJOR\fR,\fIMINOR\fR
+create a block device node with major and minor numbers MAJOR and MINOR
+.TP
+\fB\-c\fR, \fB\-\-char\fR=\fIMAJOR\fR,\fIMINOR\fR
+create a character device node with major and minor numbers MAJOR and MINOR
+.TP
+\fB\-d\fR, \fB\-\-directory\fR
+treat all arguments as directory names
+.TP
+\fB\-g\fR, \fB\-\-group\fR=\fIGROUP\fR
+set group to GROUP (default is "root")
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+show detailed usage information
+.TP
+\fB\-i\fR, \fB\-\-image\fR=\fIIMAGE\fR
+use file IMAGE as ext2 filesystem image to operate on
+.TP
+\fB\-l\fR, \fB\-\-link\fR=\fITARGET\fR
+create a symbolic link with contents TARGET
+.TP
+\fB\-m\fR, \fB\-\-mode\fR=\fIMODE\fR
+set access permissions to MODE (default is 0755)
+.TP
+\fB\-o\fR, \fB\-\-owner\fR=\fIOWNER\fR
+set owner to OWNER (default is "root")
+.TP
+\fB\-s\fR, \fB\-\-strip\fR
+strip symbols from executable and dynamic objects
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+show detailed status information
+.SH SEE ALSO
+.BR mke2fs (8)

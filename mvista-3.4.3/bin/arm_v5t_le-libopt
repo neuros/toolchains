@@ -1,0 +1,587 @@
+#!/usr/bin/env python
+
+#
+#  FILE:  libopt
+#
+#  DESCRIPTION:
+#    Rebuilds supported libraries with only object files providing
+#    symbols required by binaries in a specified file tree.
+#
+#  AUTHOR:  MontaVista Software, Inc. <source@mvista.com>
+#
+#  Copyright 2000-2002,2004 MontaVista Software Inc.
+#
+#  This program is free software; you can redistribute  it and/or modify it
+#  under  the terms of  the GNU General  Public License as published by the
+#  Free Software Foundation;  either version 2 of the  License, or (at your
+#  option) any later version.
+#
+#  THIS  SOFTWARE  IS PROVIDED   ``AS  IS'' AND   ANY  EXPRESS OR IMPLIED
+#  WARRANTIES,   INCLUDING, BUT NOT  LIMITED  TO, THE IMPLIED WARRANTIES OF
+#  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
+#  NO  EVENT  SHALL   THE AUTHOR  BE    LIABLE FOR ANY   DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+#  NOT LIMITED   TO, PROCUREMENT OF  SUBSTITUTE GOODS  OR SERVICES; LOSS OF
+#  USE, DATA,  OR PROFITS; OR  BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+#  ANY THEORY OF LIABILITY, WHETHER IN  CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+#  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#  You should have received a copy of the  GNU General Public License along
+#  with this program; if not, write  to the Free Software Foundation, Inc.,
+#  675 Mass Ave, Cambridge, MA 02139, USA.
+#
+
+#
+#  Usage:  libopt [ -s ] [ -d <desttree> ] <srctree>
+#	-s		strip optimized libraries
+#	-d <desttree>	specifies the base of the file hierarchy where
+#			optimized libraries will be placed; if not
+#			specified, <srctree> will be used
+#	<srctree>	the base of the file hierarchy representing the
+#			file system environment that should be optimized
+#
+
+from sys import argv, exit, stderr
+import os
+import re
+import stat
+import string
+from getopt import getopt
+
+
+class Symbol:
+    def __init__(self, name, type):
+	endname = string.find(name, '@')
+	if endname == -1:
+	    self.name = name
+	    self.version = None
+	    self.default = 1
+	else:
+	    self.name = name[:endname]
+	    if name[endname + 1] == '@':
+		self.default = 1
+		self.version = name[endname + 2:]
+	    else:
+		self.default = 0
+		self.version = name[endname + 1:]
+	self.type = type
+
+    def getDefaultName(self):
+	if self.default:
+	    return self.name
+	else:
+	    return self.getFullName()
+
+    def getFullName(self):
+	if self.version != None:
+	    return '%s@%s' % (self.name, self.version)
+	else:
+	    return self.name
+
+    def getName(self):
+	return self.name
+
+    def isDefined(self):
+	return (not self.isUndefined())
+
+    def isUndefined(self):
+	return (self.type in ('U', 'u'))
+
+    def needsCopy(self):
+	return (self.type in ('d', 'w', 'c'))
+
+
+class RelocatableObject:
+    def __init__(self, name):
+	self.name = name
+	self.required = []
+	self.symbols = []
+	self.unresolved = []
+
+    def addRequiredObject(self, objname):
+	self.required.append(objname)
+
+    def addSymbol(self, symbol):
+	if symbol.isDefined():
+	    self.symbols.append(symbol)
+	if symbol.isUndefined() or symbol.needsCopy():
+	    self.unresolved.append(symbol)
+
+    def getName(self):
+	return self.name
+
+    def getRequiredObjects(self):
+	return self.required
+
+    def getSymbols(self):
+	return self.symbols
+
+    def getUnresolvedSymbols(self):
+	return self.unresolved
+
+
+class UnusedException(Exception):
+    pass
+
+
+class OptimizerData:
+    def __init__(self, dir, libraries):
+	self.referenced = 0
+	self.dir = dir
+	pathfilename = os.path.join(dir, 'path')
+
+	try:
+	    pathfile = open(pathfilename)
+
+	    try:
+		self.path = pathfile.read()
+	    finally:
+		pathfile.close()
+	except:
+	    raise IOError('cannot read "%s"' % pathfilename)
+
+	if self.path[-1:] == '\n':
+	    self.path = self.path[:-1]
+
+	if libraries.get(self.path) == None:
+	    # This library is not present in the source directory tree
+	    raise UnusedException(self.path)
+
+	self.objects = {}
+	self.included = {}
+	self.required = []
+	self.optional = []
+
+	self.symbols = {}
+	self.unresolved = {}
+	self.resolved = {}
+	self.references = {}
+
+	index = open(os.path.join(dir, 'index'))
+	line = index.readline()
+	while line != '':
+	    if line[-1] == '\n':
+		line = line[:-1]
+	    if len(line) > 0:
+		type, name = string.split(line)
+
+		if type in ('O', 'R'):
+		    object = RelocatableObject(name)
+		    self.objects[name] = object
+		    if type == 'R':
+			self.required.append(object)
+		elif type == 'I':
+		    object.addRequiredObject(name)
+		else:
+		    assert type in ('D', 'd', 'W', 'w', 'C', 'c', 'U', 'u')
+		    symbol = Symbol(name, type)
+		    object.addSymbol(symbol)
+
+		    if symbol.isDefined():
+			self.symbols[symbol.getFullName()] = object
+			self.symbols[symbol.getDefaultName()] = object
+			#CHECK: what if no entry for symbol.name?
+			#  enter it anyway?
+	    line = index.readline()
+
+	for object in self.required:
+	    self.addObject(object)
+
+    def addObject(self, object):
+	name = object.getName()
+	if self.included.get(name) == None:
+	    self.included[name] = object
+	    if object not in self.required:
+		self.optional.append(name)
+	    for symbol in object.getUnresolvedSymbols():
+		if self.resolved.get(symbol.getFullName()) == None:
+		    self.unresolved[symbol.getFullName()] = symbol
+	    for reqname in object.getRequiredObjects():
+		self.addObjectByName(reqname)
+
+    def addObjectByName(self, objname):
+	object = self.objects[objname]
+	if object == None:
+	    exit('Internal Error:  object "%s" not found in "%s"'
+		    % (objname, self.path))
+	else:
+	    self.addObject(object)
+
+    def addSymbol(self, symbol, user):
+	object = self.symbols.get(symbol.getFullName())
+	if object == None:
+	    return 0
+	else:
+	    self.referenced = 1
+	    references = self.references.get(symbol.getFullName())
+	    if references == None:
+		self.references[symbol.getFullName()] = [user]
+	    else:
+		references.append(user)
+	    self.addObject(object)
+
+    def build(self, archdir, archprefix, destdir, strip):
+	# Make dest use an absolute path
+	cwd = os.getcwd()
+	dest = os.path.normpath(os.path.join(cwd, destdir, self.path[1:]))
+
+	dir = os.path.dirname(dest)
+	if not os.path.isdir(dir):
+	    try:
+		os.makedirs(dir)
+	    except:
+		exit('Error:  cannot create directory "%s"\n' % dir)
+
+	os.chdir(self.dir)
+
+	# Run library build program
+	command = './build %s %s %s %s %s' % \
+	    (archdir, archprefix, dest, strip, string.join(self.optional))
+	if os.system(command) != 0:
+	    exit('Error building "%s"' % self.path)
+
+	# Return to original directory
+	os.chdir(cwd)
+
+    def getIncludedObjects(self):
+	objects = self.included.keys()[:]
+	objects.sort()
+	return map(self.included.get, objects)
+
+    def getPath(self):
+	return self.path
+
+    def getReferencedSymbols(self, object):
+	references = []
+	for symbol in object.getSymbols():
+	    if self.references.get(symbol.getFullName()) != None:
+		references.append(symbol)
+	return references
+
+    def getSymbolUsers(self, symbol):
+	users = self.references.get(symbol.getFullName(), [])
+	users.sort()
+	return users
+
+    def isReferenced(self):
+	return self.referenced
+
+    def resolveSymbols(self, optimizers):
+	symbols = self.unresolved.values()
+	if len(symbols) == 0:
+	    return 0
+	else:
+	    for symbol in tuple(symbols):
+		for library in optimizers.getAll():
+		    if library == self:
+			continue
+		    library.addSymbol(symbol, self.path)
+		self.resolved[symbol.getFullName()] = symbol
+		del self.unresolved[symbol.getFullName()]
+	    return 1
+
+
+class OptimizerSet:
+    def __init__(self, optdir, libraries):
+	self.data = {}
+
+	for name in os.listdir(optdir):
+	    libdir = os.path.join(optdir, name)
+	    if os.path.isdir(libdir):
+		try:
+		    data = OptimizerData(libdir, libraries)
+		    self.data[data.getPath()] = data
+		except UnusedException:
+		    pass
+		except IOError, exc:
+		    stderr.writeln('Warning:  %s' % exc)
+
+    def get(self, path):
+	return self.data.get(path)
+
+    def getAll(self):
+	return self.data.values()
+
+
+class DynamicSymbol(Symbol):
+    def DynamicExpression():
+	addr = '[0-9a-fA-F]+'
+	flags = ' [^l](?P<weak>.)...D(?P<function>.) '
+	section = '(?P<section>[^\t]*)\t'
+	version = ' +(?P<version>[^ ]*) +'
+	name = '(?P<name>[^ \n]+)\n?$'
+	return addr + flags + section + addr + version + name
+
+    dynamic_re = re.compile(DynamicExpression())
+
+    def __init__(self, line):
+	match = DynamicSymbol.dynamic_re.match(line)
+	if match == None:
+	    raise ValueError('not a valid symbol specification')
+
+	section = match.group('section')
+
+	weak = (match.group('weak') == 'w')
+	undefined = (section == '*UND*')
+	common = (section == '*CMN*')
+
+	if undefined:
+	    if weak:
+		self.type = 'u'
+	    else:
+		self.type = 'U'
+	elif weak:
+	    self.type = 'W'
+	elif common:
+	    self.type = 'C'
+	else:
+	    self.type = 'G'
+
+	self.name = match.group('name')
+	self.version = match.group('version')
+	self.default = 1
+	self.function = (match.group('function') == 'F')
+
+	if (self.version == 'Base') or (self.version == ''):
+	    self.version = None
+	elif self.version[0] == '(':
+	    self.version = self.version[1:-1]
+	    if self.version != 'Base':
+		self.default = 0
+	    else:
+		self.version = None
+
+    def isFunction(self):
+	return self.function
+
+
+copy_reloc = re.compile('^[0-9a-fA-F]+ R_[0-9A-Z]+_COPY +(?P<name>[^ ]+)\n$')
+
+def ProcessDynamicFile(hostpath, targetpath, optimizers):
+    # Process dynamic symbols
+    symbols = {}
+    copySymbols = []
+
+    dump = os.popen('%sobjdump -T -R %s' % (toolprefix, hostpath))
+    line = dump.readline()
+    while line != '':
+	try:
+	    symbol = DynamicSymbol(line)
+	    if symbol.isDefined():
+		if symbols.get(symbol.getDefaultName()) != None:
+		    exit('Internal Error:  multiple definitions for symbol "%s" in file "%s"'
+			    % (symbol.getDefaultName(), targetpath))
+		else:
+		    symbols[symbol.getDefaultName()] = symbol
+	    else:
+		for library in optimizers.getAll():
+		    library.addSymbol(symbol, targetpath)
+
+	    # Temporarily treat all data objects as undefined
+	    # This will handle copy relocation entries
+	    #if (symbol.isUndefined()) or (not symbol.isFunction()):
+	    #    for library in optimizers.getAll():
+	    #        library.Resolve(symbol)
+	except ValueError:
+	    # Not a symbol; might be a copy relocation entry.
+	    match = copy_reloc.match(line)
+	    if match != None:
+		copySymbols.append(match.group('name'))
+
+	line = dump.readline()
+
+    if dump.close() != None:
+	exit('Error processing file "%s"' % hostpath)
+
+    # Handle copy relocation symbols.  These are symbols whose initial
+    # values are copied at runtime from a referenced shared object.
+    for name in copySymbols:
+	symbol = symbols.get(name)
+	if symbol == None:
+	    exit('Internal error:  unmatched copy relocation "%s" in file "%s"'
+		    % (name, targetpath))
+	else:
+	    for library in optimizers.getAll():
+		library.addSymbol(symbol, targetpath)
+
+
+def ELFType(path):
+    try:
+	file = open(path)
+    except:
+	stderr.write('Warning:  cannot read file "%s"\n' % path)
+	return None
+
+    try:
+	header = file.read(18)
+	file.close()
+    except:
+	file.close()
+	return None
+
+    if header[:4] == "\x7f" "ELF":
+	ei_data = ord(header[5])
+	if ei_data == 1:
+	    #LSB encoding
+	    type = ord(header[16]) + (ord(header[17]) * 256)
+	elif ei_data == 2:
+	    #MSB encoding
+	    type = ord(header[17]) + (ord(header[16]) * 256)
+	else:
+	    #unknown encoding
+	    exit('Error:  Invalid ELF file "%s"' % path)
+
+	if type == 2:
+	    #ET_EXEC
+	    results = os.popen('%sobjdump -p %s' % (toolprefix, path))
+	    line = results.readline()
+	    while line != '':
+		try:
+		    tag, value = string.split(line)
+		    if tag == 'NEEDED':
+			results.close()
+			return 'E'
+		except ValueError:
+		    pass
+		line = results.readline()
+	    if results.close() != None:
+		exit('Error processing file "%s"' % path)
+	    return None
+	elif type == 3:
+	    #ET_DYN
+	    return 'D'
+
+    # Not an ELF file, or not an executable or shared object
+    return None
+
+
+def SearchDirectory(hostdir, targetdir, executables, libraries):
+    for name in os.listdir(hostdir):
+	hostpath = os.path.join(hostdir, name)
+	targetpath = string.join((targetdir, name), '/')
+
+	stats = os.lstat(hostpath)
+	mode = stats[stat.ST_MODE]
+	if stat.S_ISREG(mode):
+	    type = ELFType(hostpath)
+	    if type == 'E':
+		executables[targetpath] = hostpath
+	    elif type == 'D':
+		libraries[targetpath] = hostpath
+	elif stat.S_ISDIR(mode):
+	    SearchDirectory(hostpath, targetpath, executables, libraries)
+
+
+class UsageException(Exception):
+    pass
+
+
+#
+# MAIN
+#
+
+try:
+    strip = 'nostrip'
+    ignore_errs = 0
+    destdir = None
+    srcdir = None
+    symbolTrace = 0
+
+    args = argv[1:]
+
+    try:
+	while len(args) > 0:
+	    options, args = getopt(args, 'sid:S:')
+
+	    for option in options:
+		if option[0] == '-s':
+		    strip = 'strip'
+		elif option[0] == '-i':
+		    ignore_errs = 1
+		elif option[0] == '-d':
+		    if destdir != None:
+			raise UsageException
+		    destdir = os.path.normpath(option[1])
+		    if not os.path.isdir(destdir):
+			exit('Invalid destination directory "%s"' % destdir)
+		elif option[0] == '-S':
+		    try:
+			symbolTrace = int(option[1])
+			if (symbolTrace < 0) or (symbolTrace > 3):
+			    raise UsageException
+		    except:
+			raise UsageException
+
+	    if len(args) > 0:
+		if srcdir != None:
+		    raise UsageException
+		srcdir = os.path.normpath(args[0])
+		if not os.path.isdir(srcdir):
+		    exit('Invalid source directory "%s"' % srcdir)
+		args = args[1:]
+
+	if srcdir == None:
+	    raise UsageException
+    except UsageException:
+	exit('Usage:  %s [-s] [ -S 0|1|2|3 ] [ -d <destdir> ] <srcdir>' % argv[0])
+
+    if destdir == None:
+	destdir = srcdir
+
+    end = string.rfind(argv[0], 'libopt')
+    if (end == -1) or (end != (len(argv[0]) - len('libopt'))):
+	exit('Error:  cannot locate architecture tools')
+    else:
+	toolprefix = argv[0][:end]
+
+    archprefix = os.path.basename(toolprefix)
+    archdir = os.path.dirname(os.path.dirname(toolprefix))
+    optdir = os.path.join(archdir, 'target', 'usr', 'lib', 'optinfo')
+    if not os.path.isdir(optdir):
+	exit('Error:  cannot locate optimizer data directory "%s"' % optdir)
+
+    executables = {}
+    libraries = {}
+
+    SearchDirectory(srcdir, '', executables, libraries)
+
+    optimizers = OptimizerSet(optdir, libraries)
+    if len(optimizers.getAll()) == 0:
+	print 'No optimizable libraries found.'
+	exit(0)
+
+    for targetpath, hostpath in executables.items():
+	ProcessDynamicFile(hostpath, targetpath, optimizers)
+
+    for targetpath, hostpath in libraries.items():
+	if optimizers.get(targetpath) == None:
+	    ProcessDynamicFile(hostpath, targetpath, optimizers)
+
+    unresolved = 1
+    while unresolved:
+	unresolved = 0
+	for library in optimizers.getAll():
+	    unresolved = (library.resolveSymbols(optimizers) or unresolved)
+
+    for library in optimizers.getAll():
+	if library.isReferenced():
+	    library.build(archdir, archprefix, destdir, strip)
+	    if symbolTrace > 0:
+		for object in library.getIncludedObjects():
+		    if symbolTrace == 1:
+			print library.getPath(), object.getName()
+		    else:
+			symbols = library.getReferencedSymbols(object)
+			symbols.sort(lambda s1, s2:
+			    cmp(s1.getDefaultName(), s2.getDefaultName()))
+			for symbol in symbols:
+			    print library.getPath(), object.getName(), symbol.getDefaultName()
+			    if symbolTrace == 3:
+				for user in library.getSymbolUsers(symbol):
+				    print '    %s' % user
+	else:
+	    print 'No symbols in "%s" referenced; skipping build.' % library.getPath()
+	    print '    This library may be unused, or may be used via dlopen().'
+except KeyboardInterrupt:
+    exit(1)

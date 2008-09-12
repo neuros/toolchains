@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+
+#
+#  FILE:  libindex
+#
+#  DESCRIPTION:
+#    Program to generate index files for library optimizer.
+#
+#  AUTHOR:  MontaVista Software, Inc. <source@mvista.com>
+#
+#  Copyright 2000-2001,2004 MontaVista Software Inc.
+#
+#  This program is free software; you can redistribute  it and/or modify it
+#  under  the terms of  the GNU General  Public License as published by the
+#  Free Software Foundation;  either version 2 of the  License, or (at your
+#  option) any later version.
+#
+#  THIS  SOFTWARE  IS PROVIDED   ``AS  IS'' AND   ANY  EXPRESS OR IMPLIED
+#  WARRANTIES,   INCLUDING, BUT NOT  LIMITED  TO, THE IMPLIED WARRANTIES OF
+#  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
+#  NO  EVENT  SHALL   THE AUTHOR  BE    LIABLE FOR ANY   DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+#  NOT LIMITED   TO, PROCUREMENT OF  SUBSTITUTE GOODS  OR SERVICES; LOSS OF
+#  USE, DATA,  OR PROFITS; OR  BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+#  ANY THEORY OF LIABILITY, WHETHER IN  CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+#  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#  You should have received a copy of the  GNU General Public License along
+#  with this program; if not, write  to the Free Software Foundation, Inc.,
+#  675 Mass Ave, Cambridge, MA 02139, USA.
+#
+
+#
+#  Usage:  libindex <shlib> [-w] { [ -r | -o ] <objects> }...
+#
+#  The library index is generated to standard output.
+#
+
+from os import environ, popen
+from sys import argv, exit, stderr
+from string import lower, rfind, split
+import re
+
+
+class Symbol:
+    def __init__(self, name, version, type, default):
+	self.name = name
+	self.version = version
+	self.type = type
+	self.default = default
+
+	if version != None:
+	    self.fullname = name + '@' + version
+	else:
+	    self.fullname = name
+
+    def defname(self):
+	if (self.version != None) and self.default:
+	    return self.name + '@@' + self.version
+	else:
+	    return self.fullname
+
+    def setNeedsCopy(self):
+	self.type = lower(self.type)
+
+
+def DynamicExpression():
+    addr = '[0-9a-fA-F]+'
+    flags = ' [^l](?P<weak>.)...D. '
+    section = '(?P<section>[^\t]*)\t'
+    version = ' +(?P<version>[^ ]*) +'
+    name = '(?P<name>[^ \n]+)\n?$'
+    return addr + flags + section + addr + version + name
+
+dynamic_re = re.compile(DynamicExpression())
+
+def ParseDynamic(line):
+    match = dynamic_re.match(line)
+    if match == None:
+	return None
+
+    section = match.group('section')
+
+    weak = (match.group('weak') == 'w')
+    undefined = (section == '*UND*')
+    common = (section == '*CMN*')
+
+    if undefined:
+	if weak:
+	    type = 'u'
+	else:
+	    type = 'U'
+    elif weak:
+	type = 'W'
+    elif common:
+	type = 'C'
+    else:
+	type = 'G'
+
+    name = match.group('name')
+    version = match.group('version')
+    default = 1
+
+    if (version == 'Base') or (version == ''):
+	version = None
+    elif version[0] == '(':
+	version = version[1:-1]
+	assert version != 'Base'
+	default = 0
+
+    return Symbol(name, version, type, default)
+
+
+copy_reloc = re.compile('^[0-9a-fA-F]+ R_[0-9A-Z]+_COPY +(?P<name>[^ ]+)\n$')
+
+class Library:
+    def __init__(self, file):
+	self.symbols = {}
+	self.undefined = {}
+	self.resolve = {}
+	copyReloc = []
+
+	dump = popen("%sobjdump -T -R %s" % (toolprefix, file))
+	line = dump.readline()
+	while line != '':
+	    symbol = ParseDynamic(line)
+	    if symbol != None:
+		if symbol.type in ("U", "u"):
+		    dict = self.undefined
+		else:
+		    dict = self.symbols
+
+		if symbol.version != None:
+		    dict[symbol.fullname] = symbol
+		if symbol.default:
+		    dict[symbol.name] = symbol
+	    else:
+		match = copy_reloc.match(line)
+		if match != None:
+		    copyReloc.append(match.group('name'))
+	    line = dump.readline()
+
+	if dump.close() != None:
+	    exit('Error processing file "%s"' % file)
+
+	for name in copyReloc:
+	    symbol = self.symbols.get(name)
+	    if symbol == None:
+		exit('Internal error:  unmatched copy relocation "%s" in file "%s"'
+			    % (name, file))
+	    else:
+		symbol.setNeedsCopy()
+
+
+def ParseRelocatable(line):
+    fields = split(line)
+
+    namefields = split(fields[0], "@")
+    name = namefields[0]
+    if len(namefields) > 1:
+	version = namefields[len(namefields) - 1]
+    else:
+	version = None
+    default = (len(namefields) == 3)
+
+    type = fields[1]
+    if type == 'w':
+	type = 'u'
+
+    return Symbol(name, version, type, default)
+
+
+class Object:
+    def __init__(self, file, library, required):
+	self.file = file
+	self.library = library
+	self.required = required
+	self.undefined = []
+	self.resolve = []
+	self.symbols = []
+	self.needed = []
+
+	names = popen("%snm -g -P %s" % (toolprefix, file))
+	for line in names.readlines():
+	    symbol = ParseRelocatable(line)
+	    if symbol == None:
+		continue
+
+	    if symbol.type in ("U", "u"):
+		self.resolve.append(symbol)
+	    else:
+		if symbol.version != None:
+		    libsym = library.symbols.get(symbol.fullname)
+		    if libsym != None and symbol.default != libsym.default:
+			stderr.write("Default mismatch!\n")
+		else:
+		    libsym = library.symbols.get(symbol.name)
+
+		if libsym != None:
+		    self.symbols.append(libsym)
+		    symbol = libsym
+
+		if symbol.version != None:
+		    library.resolve[symbol.fullname] = self
+		    if symbol.default or (library.resolve.get(symbol.name) == None):
+			library.resolve[symbol.name] = self
+		else:
+		    library.resolve[symbol.name] = self
+
+    def resolveall(self):
+	for symbol in self.resolve:
+	    object = self.library.resolve.get(symbol.fullname)
+
+	    if object != None:
+		if not (object in self.needed):
+		    self.needed.append(object)
+	    else:
+		libsym = library.undefined.get(symbol.fullname)
+
+		if libsym != None:
+		    self.undefined.append(libsym)
+		elif showwarnings and (symbol.type != "u"):
+		    stderr.write("Can't resolve '%s' in '%s'\n" % (symbol.name, self.file))
+
+    def generate(self):
+	print
+	if self.required:
+	    print "R", self.file
+	else:
+	    print "O", self.file
+	for object in self.needed:
+	    if not object.required:
+		print "I", object.file
+	for symbol in self.symbols:
+	    type = symbol.type
+	    if not (type in ("W", "C")):
+		type = "D"
+	    print type, symbol.defname()
+	for symbol in self.undefined:
+	    print symbol.type, symbol.defname()
+
+
+#
+#  MAIN
+#
+
+toolprefix = environ.get('HHL_TOOL_PREFIX')
+if toolprefix == None:
+    end = rfind(argv[0], 'libindex')
+    if (end == -1) or (end != (len(argv[0]) - len('libindex'))):
+	exit('Cannot locate architecture tools')
+    else:
+	toolprefix = argv[0][:end]
+
+library = Library(argv[1])
+
+required = 0
+showwarnings = 0
+
+objects = []
+for arg in argv[2:]:
+    if arg == '-w':
+	showwarnings = 1
+    elif arg == '-r':
+	required = 1
+    elif arg == '-o':
+	required = 0
+    else:
+	objects.append(Object(arg, library, required))
+
+for object in objects:
+    object.resolveall()
+    object.generate()
